@@ -1,0 +1,7 @@
+
+*.o
+*.pyc
+**/*.zip
+# Python virtual environment folder
+.venv/
+archive/
