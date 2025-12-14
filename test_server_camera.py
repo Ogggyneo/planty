@@ -1,34 +1,36 @@
 import os
 import time
-import json
 import cv2
 import torch
 import torch.nn as nn
 from torchvision import transforms
-import ssl
+import requests
 
 # =========================
-# 0. MQTT (ThingsBoard) CONFIG
+# 0. RAS CONFIG
 # =========================
-# Cách dùng nhanh:
-#   set TB_HOST=demo.thingsboard.io
-#   set TB_DEVICE_TOKEN=YOUR_TOKEN
-# TB_HOST = os.getenv("TB_HOST", "demo.thingsboard.io")
-# TB_PORT = int(os.getenv("TB_PORT", "1883"))
-TB_DEVICE_TOKEN = os.getenv("TB_DEVICE_TOKEN", "PUT_YOUR_DEVICE_TOKEN_HERE")
-
-TB_HOST = os.getenv("TB_HOST", "thingsboard.cloud")
-TB_PORT = int(os.getenv("TB_PORT", "8883"))
-TB_DEVICE_TOKEN = os.getenv("TB_DEVICE_TOKEN", "PUT_YOUR_DEVICE_TOKEN_HERE")
-
-PUBLISH_EVERY_SEC = float(os.getenv("PUBLISH_EVERY_SEC", "2.0"))
-CLIENT_ID = os.getenv("TB_CLIENT_ID", "rasp-vision-binary")
-# =========================
-# 1. MODEL CONFIG
-# =========================
-WEIGHTS_PATH = os.getenv("WEIGHTS_PATH", "tomato_disease_model_weights.pth")
+WEIGHTS_PATH = "tomato_disease_model_weights.pth"
 IMG_SIZE = 256
 
+# ESP32 AP default IP
+ESP32_IP = os.getenv("ESP32_IP", "192.168.4.1")
+ESP32_AI_URL = f"http://{ESP32_IP}/api/ai"
+
+# Camera index on Raspberry Pi (try 0 first)
+CAM_INDEX = int(os.getenv("CAM_INDEX", "0"))
+
+# Send every N seconds (avoid spamming)
+SEND_EVERY_SEC = float(os.getenv("SEND_EVERY_SEC", "2.0"))
+
+# If you are running headless (no monitor), set HEADLESS=1
+HEADLESS = os.getenv("HEADLESS", "0") == "1"
+
+# Timeout for HTTP requests
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "3.0"))
+
+# =========================
+# 1. CLASS NAMES
+# =========================
 CLASS_NAMES = [
     "Tomato___Bacterial_spot",
     "Tomato___Early_blight",
@@ -47,6 +49,7 @@ HEALTHY_CLASS_NAME = "Tomato___healthy"
 # 2. DEVICE UTILS
 # =========================
 def get_default_device():
+    # Raspberry Pi usually is CPU only
     return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 def to_device(x, device):
@@ -68,12 +71,22 @@ def ConvBlock(in_channels, out_channels, pool=False):
 class CNN_NeuralNet(nn.Module):
     def __init__(self, in_channels, num_diseases):
         super().__init__()
+
         self.conv1 = ConvBlock(in_channels, 64)
         self.conv2 = ConvBlock(64, 128, pool=True)
-        self.res1 = nn.Sequential(ConvBlock(128, 128), ConvBlock(128, 128))
+        self.res1 = nn.Sequential(
+            ConvBlock(128, 128),
+            ConvBlock(128, 128),
+        )
+
         self.conv3 = ConvBlock(128, 256, pool=True)
         self.conv4 = ConvBlock(256, 512, pool=True)
-        self.res2 = nn.Sequential(ConvBlock(512, 512), ConvBlock(512, 512))
+
+        self.res2 = nn.Sequential(
+            ConvBlock(512, 512),
+            ConvBlock(512, 512),
+        )
+
         self.classifier = nn.Sequential(
             nn.MaxPool2d(4),
             nn.Flatten(),
@@ -95,12 +108,14 @@ class CNN_NeuralNet(nn.Module):
 # =========================
 def load_trained_model(weights_path: str):
     if not os.path.exists(weights_path):
-        raise FileNotFoundError(f"Không tìm thấy file weights: {weights_path}")
+        raise FileNotFoundError(f"Không tìm thấy file: {weights_path}")
 
     device = get_default_device()
     print("✅ Device:", device)
 
-    model = CNN_NeuralNet(in_channels=3, num_diseases=len(CLASS_NAMES))
+    num_classes = len(CLASS_NAMES)
+    model = CNN_NeuralNet(in_channels=3, num_diseases=num_classes)
+
     state_dict = torch.load(weights_path, map_location=device)
     model.load_state_dict(state_dict, strict=True)
 
@@ -121,10 +136,11 @@ transform = transforms.Compose([
 def preprocess_frame(frame_bgr):
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     img_t = transform(frame_rgb)
-    return img_t.unsqueeze(0)
+    img_t = img_t.unsqueeze(0)
+    return img_t
 
 # =========================
-# 6. PREDICT (BINARY)
+# 6. PREDICT (2 states)
 # =========================
 def predict_frame_binary(frame_bgr, model, device):
     xb = preprocess_frame(frame_bgr)
@@ -135,115 +151,74 @@ def predict_frame_binary(frame_bgr, model, device):
         probs = torch.softmax(logits, dim=1)
         idx = torch.argmax(probs, dim=1).item()
         raw_label = CLASS_NAMES[idx]
-        conf = float(probs[0, idx].item())
+        conf = probs[0, idx].item()
 
     health_status = "healthy" if raw_label == HEALTHY_CLASS_NAME else "unhealthy"
-
-    # health_score 0-100 (đơn giản, ổn demo)
-    if health_status == "healthy":
-        health_score = int(round(70 + 30 * conf))          # 70..100
-    else:
-        health_score = int(round(60 - 60 * conf))          # 0..60 (bệnh càng chắc -> càng thấp)
-        health_score = max(0, min(60, health_score))
-
-    return health_status, health_score, conf, raw_label
+    return health_status, conf, raw_label
 
 # =========================
-# 7. MQTT PUBLISHER (ThingsBoard)
+# 7. SEND TO ESP32
 # =========================
-def create_tb_mqtt_client():
-    try:
-        import paho.mqtt.client as mqtt
-    except ImportError as e:
-        raise SystemExit(
-            "Thiếu paho-mqtt. Cài bằng: pip install paho-mqtt"
-        ) from e
-
-    client = mqtt.Client(client_id=CLIENT_ID, clean_session=True)
-    client.username_pw_set(TB_DEVICE_TOKEN)  # ThingsBoard auth = token as username
-    # bật TLS cho cloud
-    client.tls_set(cert_reqs=ssl.CERT_REQUIRED)
-    client.tls_insecure_set(False)
-
-    client.connect(TB_HOST, TB_PORT, keepalive=60)
-    client.loop_start()
-    return client
-
-def tb_publish_telemetry(client, data: dict):
-    payload = json.dumps(data, ensure_ascii=False)
-    # ThingsBoard telemetry topic:
-    # v1/devices/me/telemetry
-    result = client.publish("v1/devices/me/telemetry", payload=payload, qos=0)
-    return result.rc == 0
+def send_to_esp32(health_status: str, conf: float):
+    # ESP32 expects: {"healthy": true/false, "score": 0..1}
+    payload = {
+        "healthy": True if health_status == "healthy" else False,
+        "score": float(conf),
+    }
+    r = requests.post(ESP32_AI_URL, json=payload, timeout=HTTP_TIMEOUT)
+    return r.status_code, r.text
 
 # =========================
-# 8. WEBCAM LOOP + THROTTLE PUBLISH
+# 8. WEBCAM + LOOP
 # =========================
-def run_webcam_binary_and_publish():
-    if TB_DEVICE_TOKEN == "PUT_YOUR_DEVICE_TOKEN_HERE":
-        print("⚠️ Bạn chưa set TB_DEVICE_TOKEN. Set env var hoặc sửa trực tiếp trong code.")
-        print("   Ví dụ (Windows PowerShell):")
-        print('   $env:TB_HOST="demo.thingsboard.io"; $env:TB_DEVICE_TOKEN="XXXX"')
-        # vẫn cho chạy webcam để debug, nhưng sẽ không publish
-        publish_enabled = False
-        mqtt_client = None
-    else:
-        publish_enabled = True
-        mqtt_client = create_tb_mqtt_client()
-        print(f"✅ MQTT connected: {TB_HOST}:{TB_PORT}")
+def run_webcam_and_publish():
+    print("ESP32 AI URL:", ESP32_AI_URL)
+    print("CAM_INDEX:", CAM_INDEX, "| SEND_EVERY_SEC:", SEND_EVERY_SEC, "| HEADLESS:", HEADLESS)
 
     model, device = load_trained_model(WEIGHTS_PATH)
 
-    # camera index: thử 0 trước, fallback 1
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(CAM_INDEX)
     if not cap.isOpened():
-        cap = cv2.VideoCapture(1)
-    if not cap.isOpened():
-        print("❌ Không mở được camera (thử index 0/1).")
+        print("❌ Không mở được camera. Thử CAM_INDEX=0/1/2")
         return
 
-    print("🎥 Running... press 'q' to quit.")
-    last_pub = 0.0
+    print("🎥 Running. Press 'q' to quit (if not headless).")
+
+    last_send = 0.0
 
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("⚠️ Không đọc được frame.")
-            break
+            print("⚠ Không đọc được frame.")
+            time.sleep(0.2)
+            continue
 
-        health_status, health_score, conf, raw_label = predict_frame_binary(frame, model, device)
+        health_status, conf, raw_label = predict_frame_binary(frame, model, device)
 
-        # overlay
-        color = (0, 255, 0) if health_status == "healthy" else (0, 0, 255)
-        cv2.putText(frame, f"{health_status.upper()} | score={health_score} | conf={conf*100:.1f}%",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
-        cv2.putText(frame, f"raw: {raw_label}",
-                    (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
-
-        # publish throttle
         now = time.time()
-        if publish_enabled and (now - last_pub) >= PUBLISH_EVERY_SEC:
-            telemetry = {
-                "health_status": health_status,
-                "health_score": health_score,
-                "confidence": round(conf, 4),
-                "raw_label": raw_label,
-            }
-            ok = tb_publish_telemetry(mqtt_client, telemetry)
-            if not ok:
-                print("⚠️ Publish failed")
-            last_pub = now
+        if now - last_send >= SEND_EVERY_SEC:
+            try:
+                code, text = send_to_esp32(health_status, conf)
+                print(f"📤 AI -> ESP32 | {health_status} conf={conf:.3f} raw={raw_label} | {code} {text}")
+            except Exception as e:
+                print(f"❌ Send failed: {e}")
+            last_send = now
 
-        cv2.imshow("Plant Health (Binary) + ThingsBoard Telemetry", frame)
-        if (cv2.waitKey(1) & 0xFF) == ord("q"):
-            break
+        # Optional display (disable for headless)
+        if not HEADLESS:
+            label = f"{health_status.upper()} ({conf*100:.1f}%)"
+            color = (0, 255, 0) if health_status == "healthy" else (0, 0, 255)
+
+            cv2.putText(frame, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
+            cv2.putText(frame, f"raw: {raw_label}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+
+            cv2.imshow("Plant Health (Binary) - RPi Sender", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
     cap.release()
-    cv2.destroyAllWindows()
-
-    if publish_enabled and mqtt_client is not None:
-        mqtt_client.loop_stop()
-        mqtt_client.disconnect()
+    if not HEADLESS:
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    run_webcam_binary_and_publish()
+    run_webcam_and_publish()
