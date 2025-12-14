@@ -1,31 +1,16 @@
-"""
-tomato_cam_pytorch.py
-
-Chạy real-time webcam detect bệnh lá cà chua
-dùng PyTorch + model CNN_NeuralNet (state_dict trong tomato_disease_model_weights.pth)
-
-Yêu cầu:
-- pip install torch torchvision opencv-python pillow
-- Đặt file tomato_disease_model_weights.pth cùng thư mục với script này
-"""
-
 import os
 import cv2
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torchvision import transforms
 
 # =========================
 # 1. CẤU HÌNH
 # =========================
 
-# 👉 SỬA LẠI NẾU TÊN FILE KHÁC
 WEIGHTS_PATH = "tomato_disease_model_weights.pth"
+IMG_SIZE = 256
 
-IMG_SIZE = 256  # model được train với ảnh 256x256
-
-# 10 class bệnh lá cà chua (thứ tự alphabet, giống ImageFolder)
 CLASS_NAMES = [
     "Tomato___Bacterial_spot",
     "Tomato___Early_blight",
@@ -38,6 +23,8 @@ CLASS_NAMES = [
     "Tomato___Tomato_mosaic_virus",
     "Tomato___healthy",
 ]
+
+HEALTHY_CLASS_NAME = "Tomato___healthy"  # <-- dùng đúng tên trong CLASS_NAMES
 
 
 # =========================
@@ -53,13 +40,10 @@ def to_device(x, device):
 
 
 # =========================
-# 3. ĐỊNH NGHĨA MODEL (Y HỆT LÚC TRAIN)
+# 3. MODEL
 # =========================
 
 def ConvBlock(in_channels, out_channels, pool=False):
-    """
-    Conv2d + BatchNorm + ReLU (+ MaxPool2d(4) nếu pool=True)
-    """
     layers = [
         nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
         nn.BatchNorm2d(out_channels),
@@ -71,14 +55,6 @@ def ConvBlock(in_channels, out_channels, pool=False):
 
 
 class CNN_NeuralNet(nn.Module):
-    """
-    Kiến trúc:
-
-    conv1 -> conv2 (pool) -> res1 (2 conv block) + skip ->
-    conv3 (pool) -> conv4 (pool) -> res2 (2 conv block) + skip ->
-    MaxPool(4) -> Flatten -> Linear(512 -> num_classes)
-    """
-
     def __init__(self, in_channels, num_diseases):
         super().__init__()
 
@@ -115,7 +91,7 @@ class CNN_NeuralNet(nn.Module):
 
 
 # =========================
-# 4. LOAD STATE_DICT TỪ .PTH
+# 4. LOAD MODEL
 # =========================
 
 def load_trained_model(weights_path: str):
@@ -128,7 +104,6 @@ def load_trained_model(weights_path: str):
     num_classes = len(CLASS_NAMES)
     model = CNN_NeuralNet(in_channels=3, num_diseases=num_classes)
 
-    # load state_dict
     state_dict = torch.load(weights_path, map_location=device)
     model.load_state_dict(state_dict, strict=True)
 
@@ -139,32 +114,33 @@ def load_trained_model(weights_path: str):
 
 
 # =========================
-# 5. TIỀN XỬ LÝ FRAME TỪ WEBCAM
+# 5. PREPROCESS
 # =========================
 
-# Resize + ToTensor (giống lúc train: chỉ ToTensor với ảnh 256x256)
 transform = transforms.Compose([
     transforms.ToPILImage(),
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.ToTensor(),  # scale về [0,1]
+    transforms.ToTensor(),
 ])
 
 
 def preprocess_frame(frame_bgr):
-    """
-    frame_bgr: numpy array (H,W,3) đọc từ OpenCV
-    return: Tensor [1,3,256,256]
-    """
-    # BGR -> RGB
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    img_t = transform(frame_rgb)          # [3,256,256]
-    img_t = img_t.unsqueeze(0)            # [1,3,256,256]
+    img_t = transform(frame_rgb)
+    img_t = img_t.unsqueeze(0)
     return img_t
 
 
-def predict_frame(frame_bgr, model, device):
+# =========================
+# 6. PREDICT (UPDATED: 2 TRẠNG THÁI)
+# =========================
+
+def predict_frame_binary(frame_bgr, model, device):
     """
-    Trả về (label, idx) dự đoán cho 1 frame BGR
+    Trả về:
+      - health_status: 'healthy' hoặc 'unhealthy'
+      - conf: độ tự tin của class dự đoán top-1 (0..1)
+      - raw_label: label gốc (để debug)
     """
     xb = preprocess_frame(frame_bgr)
     xb = to_device(xb, device)
@@ -173,22 +149,23 @@ def predict_frame(frame_bgr, model, device):
         logits = model(xb)
         probs = torch.softmax(logits, dim=1)
         idx = torch.argmax(probs, dim=1).item()
-        label = CLASS_NAMES[idx]
+        raw_label = CLASS_NAMES[idx]
         conf = probs[0, idx].item()
 
-    return label, conf
+    health_status = "healthy" if raw_label == HEALTHY_CLASS_NAME else "unhealthy"
+    return health_status, conf, raw_label
 
 
 # =========================
-# 6. CHẠY WEBCAM
+# 7. WEBCAM DEMO
 # =========================
 
 def run_webcam_demo():
     model, device = load_trained_model(WEIGHTS_PATH)
 
-    cap = cv2.VideoCapture(0)  # nếu không được thử 1,2...
+    cap = cv2.VideoCapture(1)  # nếu không được thử 0
     if not cap.isOpened():
-        print("❌ Không mở được webcam, kiểm tra camera/index.")
+        print("❌ Không mở được webcam. Thử đổi index (0/1/2).")
         return
 
     print("🎥 Webcam đang chạy. Nhấn 'q' để thoát.")
@@ -199,22 +176,38 @@ def run_webcam_demo():
             print("⚠ Không đọc được frame từ camera.")
             break
 
-        label, conf = predict_frame(frame, model, device)
+        health_status, conf, raw_label = predict_frame_binary(frame, model, device)
 
-        text = f"{label} ({conf*100:.1f}%)"
+        # text cho demo: chỉ hiện 2 trạng thái + confidence
+        text = f"{health_status.upper()} ({conf*100:.1f}%)"
+
+        # màu: healthy xanh, unhealthy đỏ
+        color = (0, 255, 0) if health_status == "healthy" else (0, 0, 255)
 
         cv2.putText(
             frame,
             text,
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
+            0.8,
+            color,
             2,
             cv2.LINE_AA,
         )
 
-        cv2.imshow("Tomato Leaf Disease - PyTorch Webcam", frame)
+        # (optional) debug nhỏ ở dòng dưới: label gốc
+        cv2.putText(
+            frame,
+            f"raw: {raw_label}",
+            (10, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+        cv2.imshow("Plant Health (Binary) - PyTorch Webcam", frame)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
@@ -222,10 +215,6 @@ def run_webcam_demo():
     cap.release()
     cv2.destroyAllWindows()
 
-
-# =========================
-# 7. MAIN
-# =========================
 
 if __name__ == "__main__":
     run_webcam_demo()
