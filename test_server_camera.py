@@ -1,31 +1,36 @@
-"""
-tomato_cam_pytorch.py
-
-Chạy real-time webcam detect bệnh lá cà chua
-dùng PyTorch + model CNN_NeuralNet (state_dict trong tomato_disease_model_weights.pth)
-
-Yêu cầu:
-- pip install torch torchvision opencv-python pillow
-- Đặt file tomato_disease_model_weights.pth cùng thư mục với script này
-"""
-
 import os
+import time
 import cv2
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torchvision import transforms
+import requests
 
 # =========================
-# 1. CẤU HÌNH
+# 0. RAS CONFIG
 # =========================
-
-# 👉 SỬA LẠI NẾU TÊN FILE KHÁC
 WEIGHTS_PATH = "tomato_disease_model_weights.pth"
+IMG_SIZE = 256
 
-IMG_SIZE = 256  # model được train với ảnh 256x256
+# ESP32 AP default IP
+ESP32_IP = os.getenv("ESP32_IP", "192.168.4.1")
+ESP32_AI_URL = f"http://{ESP32_IP}/api/ai"
 
-# 10 class bệnh lá cà chua (thứ tự alphabet, giống ImageFolder)
+# Camera index on Raspberry Pi (try 0 first)
+CAM_INDEX = int(os.getenv("CAM_INDEX", "0"))
+
+# Send every N seconds (avoid spamming)
+SEND_EVERY_SEC = float(os.getenv("SEND_EVERY_SEC", "2.0"))
+
+# If you are running headless (no monitor), set HEADLESS=1
+HEADLESS = os.getenv("HEADLESS", "0") == "1"
+
+# Timeout for HTTP requests
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "3.0"))
+
+# =========================
+# 1. CLASS NAMES
+# =========================
 CLASS_NAMES = [
     "Tomato___Bacterial_spot",
     "Tomato___Early_blight",
@@ -38,28 +43,22 @@ CLASS_NAMES = [
     "Tomato___Tomato_mosaic_virus",
     "Tomato___healthy",
 ]
-
+HEALTHY_CLASS_NAME = "Tomato___healthy"
 
 # =========================
-# 2. HÀM TIỆN ÍCH DEVICE
+# 2. DEVICE UTILS
 # =========================
-
 def get_default_device():
+    # Raspberry Pi usually is CPU only
     return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-
 
 def to_device(x, device):
     return x.to(device, non_blocking=True)
 
-
 # =========================
-# 3. ĐỊNH NGHĨA MODEL (Y HỆT LÚC TRAIN)
+# 3. MODEL
 # =========================
-
 def ConvBlock(in_channels, out_channels, pool=False):
-    """
-    Conv2d + BatchNorm + ReLU (+ MaxPool2d(4) nếu pool=True)
-    """
     layers = [
         nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
         nn.BatchNorm2d(out_channels),
@@ -69,16 +68,7 @@ def ConvBlock(in_channels, out_channels, pool=False):
         layers.append(nn.MaxPool2d(4))
     return nn.Sequential(*layers)
 
-
 class CNN_NeuralNet(nn.Module):
-    """
-    Kiến trúc:
-
-    conv1 -> conv2 (pool) -> res1 (2 conv block) + skip ->
-    conv3 (pool) -> conv4 (pool) -> res2 (2 conv block) + skip ->
-    MaxPool(4) -> Flatten -> Linear(512 -> num_classes)
-    """
-
     def __init__(self, in_channels, num_diseases):
         super().__init__()
 
@@ -113,59 +103,46 @@ class CNN_NeuralNet(nn.Module):
         out = self.classifier(out)
         return out
 
-
 # =========================
-# 4. LOAD STATE_DICT TỪ .PTH
+# 4. LOAD MODEL
 # =========================
-
 def load_trained_model(weights_path: str):
     if not os.path.exists(weights_path):
         raise FileNotFoundError(f"Không tìm thấy file: {weights_path}")
 
     device = get_default_device()
-    print("✅ Dùng device:", device)
+    print("✅ Device:", device)
 
     num_classes = len(CLASS_NAMES)
     model = CNN_NeuralNet(in_channels=3, num_diseases=num_classes)
 
-    # load state_dict
     state_dict = torch.load(weights_path, map_location=device)
     model.load_state_dict(state_dict, strict=True)
 
     model = to_device(model, device)
     model.eval()
-    print(f"✅ Đã load model từ {weights_path}")
+    print(f"✅ Loaded weights: {weights_path}")
     return model, device
 
-
 # =========================
-# 5. TIỀN XỬ LÝ FRAME TỪ WEBCAM
+# 5. PREPROCESS
 # =========================
-
-# Resize + ToTensor (giống lúc train: chỉ ToTensor với ảnh 256x256)
 transform = transforms.Compose([
     transforms.ToPILImage(),
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.ToTensor(),  # scale về [0,1]
+    transforms.ToTensor(),
 ])
 
-
 def preprocess_frame(frame_bgr):
-    """
-    frame_bgr: numpy array (H,W,3) đọc từ OpenCV
-    return: Tensor [1,3,256,256]
-    """
-    # BGR -> RGB
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    img_t = transform(frame_rgb)          # [3,256,256]
-    img_t = img_t.unsqueeze(0)            # [1,3,256,256]
+    img_t = transform(frame_rgb)
+    img_t = img_t.unsqueeze(0)
     return img_t
 
-
-def predict_frame(frame_bgr, model, device):
-    """
-    Trả về (label, idx) dự đoán cho 1 frame BGR
-    """
+# =========================
+# 6. PREDICT (2 states)
+# =========================
+def predict_frame_binary(frame_bgr, model, device):
     xb = preprocess_frame(frame_bgr)
     xb = to_device(xb, device)
 
@@ -173,59 +150,75 @@ def predict_frame(frame_bgr, model, device):
         logits = model(xb)
         probs = torch.softmax(logits, dim=1)
         idx = torch.argmax(probs, dim=1).item()
-        label = CLASS_NAMES[idx]
+        raw_label = CLASS_NAMES[idx]
         conf = probs[0, idx].item()
 
-    return label, conf
-
+    health_status = "healthy" if raw_label == HEALTHY_CLASS_NAME else "unhealthy"
+    return health_status, conf, raw_label
 
 # =========================
-# 6. CHẠY WEBCAM
+# 7. SEND TO ESP32
 # =========================
+def send_to_esp32(health_status: str, conf: float):
+    # ESP32 expects: {"healthy": true/false, "score": 0..1}
+    payload = {
+        "healthy": True if health_status == "healthy" else False,
+        "score": float(conf),
+    }
+    r = requests.post(ESP32_AI_URL, json=payload, timeout=HTTP_TIMEOUT)
+    return r.status_code, r.text
 
-def run_webcam_demo():
+# =========================
+# 8. WEBCAM + LOOP
+# =========================
+def run_webcam_and_publish():
+    print("ESP32 AI URL:", ESP32_AI_URL)
+    print("CAM_INDEX:", CAM_INDEX, "| SEND_EVERY_SEC:", SEND_EVERY_SEC, "| HEADLESS:", HEADLESS)
+
     model, device = load_trained_model(WEIGHTS_PATH)
 
-    cap = cv2.VideoCapture(0)  # nếu không được thử 1,2...
+    cap = cv2.VideoCapture(CAM_INDEX)
     if not cap.isOpened():
-        print("❌ Không mở được webcam, kiểm tra camera/index.")
+        print("❌ Không mở được camera. Thử CAM_INDEX=0/1/2")
         return
 
-    print("🎥 Webcam đang chạy. Nhấn 'q' để thoát.")
+    print("🎥 Running. Press 'q' to quit (if not headless).")
+
+    last_send = 0.0
 
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("⚠ Không đọc được frame từ camera.")
-            break
+            print("⚠ Không đọc được frame.")
+            time.sleep(0.2)
+            continue
 
-        label, conf = predict_frame(frame, model, device)
+        health_status, conf, raw_label = predict_frame_binary(frame, model, device)
 
-        text = f"{label} ({conf*100:.1f}%)"
+        now = time.time()
+        if now - last_send >= SEND_EVERY_SEC:
+            try:
+                code, text = send_to_esp32(health_status, conf)
+                print(f"📤 AI -> ESP32 | {health_status} conf={conf:.3f} raw={raw_label} | {code} {text}")
+            except Exception as e:
+                print(f"❌ Send failed: {e}")
+            last_send = now
 
-        cv2.putText(
-            frame,
-            text,
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA,
-        )
+        # Optional display (disable for headless)
+        if not HEADLESS:
+            label = f"{health_status.upper()} ({conf*100:.1f}%)"
+            color = (0, 255, 0) if health_status == "healthy" else (0, 0, 255)
 
-        cv2.imshow("Tomato Leaf Disease - PyTorch Webcam", frame)
+            cv2.putText(frame, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
+            cv2.putText(frame, f"raw: {raw_label}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+            cv2.imshow("Plant Health (Binary) - RPi Sender", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
     cap.release()
-    cv2.destroyAllWindows()
-
-
-# =========================
-# 7. MAIN
-# =========================
+    if not HEADLESS:
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    run_webcam_demo()
+    run_webcam_and_publish()
