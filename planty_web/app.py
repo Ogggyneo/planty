@@ -126,3 +126,17 @@ def api_pump(cmd: PumpCmd):
         return {"ok": True, "pump": cmd.state}
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+latest_ai = {}
+
+@app.post("/api/ai")
+async def receive_ai(request: Request):
+    global latest_ai
+    latest_ai = await request.json()
+    latest_ai["ts"] = int(time.time() * 1000)
+    return {"ok": True}
+
+@app.get("/api/ai")
+def get_ai():
+    return {"ok": True, "data": latest_ai}
